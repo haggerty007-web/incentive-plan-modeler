@@ -7,24 +7,18 @@ import streamlit as st
 st.set_page_config(page_title="Incentive Plan Design & Modeling", layout="wide")
 
 st.title("Incentive Plan Design & Modeling")
-st.write("Upload historical client data, test incentive plan designs, and identify metric combinations that best align pay with shareholder value creation.")
-
-REQUIRED_COLUMNS = ["year", "revenue", "ebitda", "eps", "free_cash_flow", "roic", "tsr"]
-
-def sample_data():
-    return pd.DataFrame({
-        "year": [2019, 2020, 2021, 2022, 2023, 2024],
-        "revenue": [1000, 970, 1080, 1160, 1240, 1310],
-        "ebitda": [180, 160, 210, 235, 250, 270],
-        "eps": [2.40, 2.10, 2.80, 3.10, 3.35, 3.60],
-        "free_cash_flow": [90, 75, 105, 118, 130, 142],
-        "roic": [9.5, 8.2, 10.1, 11.0, 11.6, 12.2],
-        "tsr": [0.08, -0.12, 0.24, 0.11, 0.16, 0.13],
-    })
+st.write("Upload client data, select any incentive metrics, and test which combinations best align pay with shareholder value creation.")
 
 def read_file(file):
     if file is None:
-        return sample_data()
+        return pd.DataFrame({
+            "period": ["2020", "2021", "2022", "2023", "2024"],
+            "revenue": [1000, 1080, 1160, 1240, 1310],
+            "ebitda": [180, 210, 235, 250, 270],
+            "eps": [2.40, 2.80, 3.10, 3.35, 3.60],
+            "market_cap": [5000, 6200, 5900, 7100, 8200],
+            "stock_price": [20, 25, 23, 29, 34],
+        })
     if file.name.endswith(".csv"):
         return pd.read_csv(file)
     return pd.read_excel(file)
@@ -37,20 +31,28 @@ def clean_columns(df):
         .str.lower()
         .str.replace(" ", "_")
         .str.replace("-", "_")
+        .str.replace(".", "_")
     )
     return df
 
-def generate_weight_sets(metrics, step=25, max_metrics=3):
-    weight_sets = []
+def numeric_columns(df):
+    cols = []
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            cols.append(col)
+    return cols
+
+def generate_weight_sets(metrics, step=25, max_metrics=4):
+    sets = []
     for r in range(1, min(max_metrics, len(metrics)) + 1):
         for combo in itertools.combinations(metrics, r):
             if r == 1:
-                weight_sets.append({combo[0]: 1.0})
+                sets.append({combo[0]: 1.0})
             else:
                 for weights in itertools.product(range(step, 101, step), repeat=r):
                     if sum(weights) == 100:
-                        weight_sets.append(dict(zip(combo, [w / 100 for w in weights])))
-    return weight_sets
+                        sets.append(dict(zip(combo, [w / 100 for w in weights])))
+    return sets
 
 def payout_curve(performance, threshold, target, maximum):
     if performance < threshold:
@@ -61,34 +63,47 @@ def payout_curve(performance, threshold, target, maximum):
         return 1.0 + ((performance - target) / (maximum - target)) * 1.0
     return 2.0
 
-def run_model(df, metrics, scenarios, target_incentive, threshold, target, maximum):
-    historical_growth = df[metrics + ["tsr"]].pct_change().dropna()
-    results = []
+def run_model(df, metrics, value_col, scenarios, target_incentive, threshold, target, maximum):
+    model_df = df[metrics + [value_col]].copy()
+    model_df = model_df.apply(pd.to_numeric, errors="coerce").dropna()
 
+    growth = model_df.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(growth) < 2:
+        st.error("Not enough numeric historical data to run the model. Try using at least 4-5 periods of data.")
+        return pd.DataFrame()
+
+    results = []
     weight_sets = generate_weight_sets(metrics)
 
     for weight_set in weight_sets:
         payouts = []
-        tsrs = []
+        value_changes = []
 
         for _ in range(scenarios):
             simulated = {}
+
             for metric in metrics:
-                mean = historical_growth[metric].mean()
-                std = historical_growth[metric].std()
+                mean = growth[metric].mean()
+                std = growth[metric].std()
+                if pd.isna(std) or std == 0:
+                    std = 0.01
                 simulated[metric] = np.random.normal(mean, std)
 
-            tsr_mean = historical_growth["tsr"].mean()
-            tsr_std = historical_growth["tsr"].std()
-            simulated_tsr = np.random.normal(tsr_mean, tsr_std)
+            value_mean = growth[value_col].mean()
+            value_std = growth[value_col].std()
+            if pd.isna(value_std) or value_std == 0:
+                value_std = 0.01
+
+            simulated_value = np.random.normal(value_mean, value_std)
 
             weighted_performance = sum((1 + simulated[m]) * w for m, w in weight_set.items())
             payout_percent = payout_curve(weighted_performance, threshold, target, maximum)
 
             payouts.append(payout_percent * target_incentive)
-            tsrs.append(simulated_tsr)
+            value_changes.append(simulated_value)
 
-        correlation = np.corrcoef(payouts, tsrs)[0, 1]
+        correlation = np.corrcoef(payouts, value_changes)[0, 1]
         if np.isnan(correlation):
             correlation = 0
 
@@ -104,7 +119,7 @@ def run_model(df, metrics, scenarios, target_incentive, threshold, target, maxim
         results.append({
             "metric_mix": " / ".join([f"{int(w*100)}% {m}" for m, w in weight_set.items()]),
             "alignment_score": round(alignment_score, 1),
-            "pay_tsr_correlation": round(correlation, 2),
+            "pay_value_correlation": round(correlation, 2),
             "average_payout": round(avg_payout, 0),
             "payout_volatility": round(volatility, 0),
         })
@@ -125,70 +140,84 @@ with st.sidebar:
 df = clean_columns(read_file(uploaded_file))
 
 st.subheader("Data Preview")
-st.dataframe(df)
+st.dataframe(df, use_container_width=True)
 
-missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-if missing:
-    st.warning("Missing expected columns: " + ", ".join(missing))
-    st.write("For best results, use columns named: year, revenue, ebitda, eps, free_cash_flow, roic, tsr")
+num_cols = numeric_columns(df)
+
+if len(num_cols) < 2:
+    st.error("Your file needs at least two numeric columns.")
 else:
-    available_metrics = ["revenue", "ebitda", "eps", "free_cash_flow", "roic"]
+    st.subheader("Column Mapping")
+
+    value_col = st.selectbox(
+        "Select shareholder value / outcome measure",
+        num_cols,
+        index=0
+    )
+
+    metric_options = [c for c in num_cols if c != value_col]
 
     selected_metrics = st.multiselect(
         "Select incentive metrics to test",
-        available_metrics,
-        default=["revenue", "ebitda", "eps", "free_cash_flow", "roic"]
+        metric_options,
+        default=metric_options[: min(5, len(metric_options))]
     )
 
+    st.caption("Examples: revenue, EBITDA, EPS, free cash flow, ROIC, margin, market cap, stock price, relative TSR, or any numeric metric in your file.")
+
     if st.button("Run Incentive Plan Model"):
-        with st.spinner("Running thousands of incentive plan scenarios..."):
-            results = run_model(
-                df,
-                selected_metrics,
-                scenarios,
-                target_incentive,
-                threshold,
-                target,
-                maximum
-            )
+        if len(selected_metrics) == 0:
+            st.error("Select at least one incentive metric.")
+        else:
+            with st.spinner("Running incentive plan scenarios..."):
+                results = run_model(
+                    df,
+                    selected_metrics,
+                    value_col,
+                    scenarios,
+                    target_incentive,
+                    threshold,
+                    target,
+                    maximum
+                )
 
-        st.subheader("Top Recommended Plan Designs")
-        st.dataframe(results.head(20), use_container_width=True)
+            if not results.empty:
+                st.subheader("Top Recommended Plan Designs")
+                st.dataframe(results.head(25), use_container_width=True)
 
-        best = results.iloc[0]
+                best = results.iloc[0]
+                st.success(f"Best design: {best['metric_mix']}")
 
-        st.success(f"Best design: {best['metric_mix']}")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Alignment Score", best["alignment_score"])
+                col2.metric("Pay / Value Correlation", best["pay_value_correlation"])
+                col3.metric("Average Payout", f"${best['average_payout']:,.0f}")
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Alignment Score", best["alignment_score"])
-        col2.metric("Pay / TSR Correlation", best["pay_tsr_correlation"])
-        col3.metric("Average Payout", f"${best['average_payout']:,.0f}")
+                st.subheader("Top Plan Designs")
+                fig = px.bar(
+                    results.head(15),
+                    x="alignment_score",
+                    y="metric_mix",
+                    orientation="h",
+                    title="Top 15 Incentive Plan Designs"
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Alignment Score by Plan Design")
-        fig = px.bar(
-            results.head(15),
-            x="alignment_score",
-            y="metric_mix",
-            orientation="h",
-            title="Top 15 Incentive Plan Designs"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+                st.subheader("Pay-for-Performance Risk View")
+                fig2 = px.scatter(
+                    results,
+                    x="average_payout",
+                    y="pay_value_correlation",
+                    size="alignment_score",
+                    hover_name="metric_mix",
+                    title="Average Payout vs Pay / Shareholder Value Correlation"
+                )
+                st.plotly_chart(fig2, use_container_width=True)
 
-        st.subheader("Pay-for-Performance Risk View")
-        fig2 = px.scatter(
-            results,
-            x="average_payout",
-            y="pay_tsr_correlation",
-            size="alignment_score",
-            hover_name="metric_mix",
-            title="Average Payout vs Pay/TSR Correlation"
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-        csv = results.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Results",
-            data=csv,
-            file_name="incentive_plan_modeling_results.csv",
-            mime="text/csv"
-        )
+                csv = results.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download Results",
+                    data=csv,
+                    file_name="incentive_plan_modeling_results.csv",
+                    mime="text/csv"
+                )
