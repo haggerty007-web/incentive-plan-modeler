@@ -7,7 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="Incentive Plan Design & Modeling", layout="wide")
 
 st.title("Incentive Plan Design & Modeling")
-st.write("Upload client data, select any incentive metrics, and test which combinations best align pay with shareholder value creation.")
+st.write("Upload client data, select incentive metrics, and identify plan designs that best align payouts with shareholder value creation.")
 
 def read_file(file):
     if file is None:
@@ -36,11 +36,7 @@ def clean_columns(df):
     return df
 
 def numeric_columns(df):
-    cols = []
-    for col in df.columns:
-        if pd.api.types.is_numeric_dtype(df[col]):
-            cols.append(col)
-    return cols
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
 def generate_weight_sets(metrics, step=25, max_metrics=4):
     sets = []
@@ -54,72 +50,57 @@ def generate_weight_sets(metrics, step=25, max_metrics=4):
                         sets.append(dict(zip(combo, [w / 100 for w in weights])))
     return sets
 
-def payout_curve(performance, threshold, target, maximum):
-    if performance < threshold:
-        return 0
-    if performance < target:
-        return 0.5 + ((performance - threshold) / (target - threshold)) * 0.5
-    if performance < maximum:
-        return 1.0 + ((performance - target) / (maximum - target)) * 1.0
+def payout_curve(score, threshold, target, maximum):
+    if score < threshold:
+        return 0.0
+    if score < target:
+        return 0.5 + ((score - threshold) / (target - threshold)) * 0.5
+    if score < maximum:
+        return 1.0 + ((score - target) / (maximum - target)) * 1.0
     return 2.0
 
-def run_model(df, metrics, value_col, scenarios, target_incentive, threshold, target, maximum):
-    model_df = df[metrics + [value_col]].copy()
-    model_df = model_df.apply(pd.to_numeric, errors="coerce").dropna()
+def run_model(growth, metrics, value_col, scenarios, target_incentive, threshold, target, maximum):
+    cols = metrics + [value_col]
+    means = growth[cols].mean().values
+    cov = growth[cols].cov().values
 
-    growth = model_df.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-
-    if len(growth) < 2:
-        st.error("Not enough numeric historical data to run the model. Try using at least 4-5 periods of data.")
-        return pd.DataFrame()
+    sims = np.random.multivariate_normal(means, cov, size=scenarios)
+    sim_df = pd.DataFrame(sims, columns=cols)
 
     results = []
     weight_sets = generate_weight_sets(metrics)
 
     for weight_set in weight_sets:
-        payouts = []
-        value_changes = []
+        performance_score = np.zeros(len(sim_df))
 
-        for _ in range(scenarios):
-            simulated = {}
+        for metric, weight in weight_set.items():
+            performance_score += (1 + sim_df[metric]) * weight
 
-            for metric in metrics:
-                mean = growth[metric].mean()
-                std = growth[metric].std()
-                if pd.isna(std) or std == 0:
-                    std = 0.01
-                simulated[metric] = np.random.normal(mean, std)
+        payout_multiple = np.array([
+            payout_curve(x, threshold, target, maximum)
+            for x in performance_score
+        ])
 
-            value_mean = growth[value_col].mean()
-            value_std = growth[value_col].std()
-            if pd.isna(value_std) or value_std == 0:
-                value_std = 0.01
+        payouts = payout_multiple * target_incentive
+        value_change = sim_df[value_col]
 
-            simulated_value = np.random.normal(value_mean, value_std)
+        corr = np.corrcoef(payouts, value_change)[0, 1]
+        if np.isnan(corr):
+            corr = 0
 
-            weighted_performance = sum((1 + simulated[m]) * w for m, w in weight_set.items())
-            payout_percent = payout_curve(weighted_performance, threshold, target, maximum)
-
-            payouts.append(payout_percent * target_incentive)
-            value_changes.append(simulated_value)
-
-        correlation = np.corrcoef(payouts, value_changes)[0, 1]
-        if np.isnan(correlation):
-            correlation = 0
-
-        avg_payout = np.mean(payouts)
-        volatility = np.std(payouts)
+        avg_payout = payouts.mean()
+        volatility = payouts.std()
 
         alignment_score = (
-            max(correlation, 0) * 60
-            + min(avg_payout / target_incentive, 2) * 20
-            + max(0, 1 - volatility / max(target_incentive, 1)) * 20
+            max(corr, 0) * 70
+            + max(0, 1 - abs((avg_payout / target_incentive) - 1)) * 20
+            + max(0, 1 - (volatility / target_incentive)) * 10
         )
 
         results.append({
             "metric_mix": " / ".join([f"{int(w*100)}% {m}" for m, w in weight_set.items()]),
             "alignment_score": round(alignment_score, 1),
-            "pay_value_correlation": round(correlation, 2),
+            "pay_value_correlation": round(corr, 2),
             "average_payout": round(avg_payout, 0),
             "payout_volatility": round(volatility, 0),
         })
@@ -139,7 +120,7 @@ with st.sidebar:
 
 df = clean_columns(read_file(uploaded_file))
 
-st.subheader("Data Preview")
+st.subheader("Raw Data Preview")
 st.dataframe(df, use_container_width=True)
 
 num_cols = numeric_columns(df)
@@ -149,11 +130,8 @@ if len(num_cols) < 2:
 else:
     st.subheader("Column Mapping")
 
-    value_col = st.selectbox(
-        "Select shareholder value / outcome measure",
-        num_cols,
-        index=0
-    )
+    date_col = st.selectbox("Select date / period column", df.columns)
+    value_col = st.selectbox("Select shareholder value measure", num_cols)
 
     metric_options = [c for c in num_cols if c != value_col]
 
@@ -163,25 +141,61 @@ else:
         default=metric_options[: min(5, len(metric_options))]
     )
 
-    st.caption("Examples: revenue, EBITDA, EPS, free cash flow, ROIC, margin, market cap, stock price, relative TSR, or any numeric metric in your file.")
+    df_sorted = df.copy()
+    df_sorted[date_col] = pd.to_datetime(df_sorted[date_col], errors="coerce")
+    df_sorted = df_sorted.sort_values(date_col)
 
-    if st.button("Run Incentive Plan Model"):
-        if len(selected_metrics) == 0:
-            st.error("Select at least one incentive metric.")
-        else:
-            with st.spinner("Running incentive plan scenarios..."):
-                results = run_model(
-                    df,
-                    selected_metrics,
-                    value_col,
-                    scenarios,
-                    target_incentive,
-                    threshold,
-                    target,
-                    maximum
-                )
+    model_cols = selected_metrics + [value_col]
+    model_df = df_sorted[[date_col] + model_cols].copy()
 
-            if not results.empty:
+    for c in model_cols:
+        model_df[c] = pd.to_numeric(model_df[c], errors="coerce")
+
+    model_df = model_df.dropna()
+    growth = model_df[model_cols].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+
+    st.subheader("Sorted Modeling Data")
+    st.dataframe(model_df, use_container_width=True)
+
+    if len(growth) < 3:
+        st.error("Not enough historical observations after cleaning. Use at least 5 periods if possible.")
+    else:
+        st.subheader("Historical Metric Relationship to Shareholder Value")
+
+        corr_table = (
+            growth.corr()[[value_col]]
+            .drop(index=value_col)
+            .rename(columns={value_col: "correlation_to_value"})
+            .sort_values("correlation_to_value", ascending=False)
+        )
+
+        st.dataframe(corr_table, use_container_width=True)
+
+        fig_corr = px.bar(
+            corr_table.reset_index(),
+            x="correlation_to_value",
+            y="index",
+            orientation="h",
+            title="Historical Correlation to Shareholder Value"
+        )
+        st.plotly_chart(fig_corr, use_container_width=True)
+
+        if st.button("Run Incentive Plan Model"):
+            if len(selected_metrics) == 0:
+                st.error("Select at least one incentive metric.")
+            else:
+                with st.spinner("Running covariance-based incentive plan scenarios..."):
+                    results = run_model(
+                        growth,
+                        selected_metrics,
+                        value_col,
+                        scenarios,
+                        target_incentive,
+                        threshold,
+                        target,
+                        maximum
+                    )
+
                 st.subheader("Top Recommended Plan Designs")
                 st.dataframe(results.head(25), use_container_width=True)
 
